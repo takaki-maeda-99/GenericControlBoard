@@ -25664,7 +25664,7 @@
 		(layer "Edge.Cuts")
 		(uuid "b347416f-d46c-47ec-86e0-5511eef3ece0")
 	)
-	(gr_text "GenericControlBoard v2\n5V ~1A / 3.3V ~1A\n4‑CAN‑Motor / 8‑Flex‑IO\nCAN Daisy‑Chain / UART/I2C"
+	(gr_text "GenericControlBoard v1\n5V ~1A / 3.3V ~1A\n4‑CAN‑Motor / 8‑Flex‑IO\nCAN Daisy‑Chain / UART/I2C"
 		(at 145 142.3 0)
 		(layer "F.SilkS")
 		(uuid "01bc7007-4412-4886-8715-5e0e7f2dd132")
@@ -25808,8 +25808,8 @@
 			(justify left bottom)
 		)
 	)
-	(gr_text "GND"
-		(at 169.1 122 0)
+	(gr_text "GN"
+		(at 170.1 122 0)
 		(layer "F.SilkS" knockout)
 		(uuid "1cc678eb-058d-46d5-9078-82d0c4098b8c")
 		(effects
@@ -25952,8 +25952,8 @@
 			(justify left bottom)
 		)
 	)
-	(gr_text "GND"
-		(at 126.7 57.8 0)
+	(gr_text "5V"
+		(at 127.7 57.8 0)
 		(layer "F.SilkS")
 		(uuid "41383c35-196f-4641-8b5e-c5315222e877")
 		(effects
@@ -26228,8 +26228,8 @@
 			(justify left bottom)
 		)
 	)
-	(gr_text "+5V"
-		(at 168.9 129.4 0)
+	(gr_text "5V"
+		(at 170.138095 129.4 0)
 		(layer "F.SilkS" knockout)
 		(uuid "90220612-6f85-41f7-a0e1-57b1d5721a09")
 		(effects
@@ -26252,7 +26252,7 @@
 			(justify left bottom)
 		)
 	)
-	(gr_text "CH"
+	(gr_text "CL"
 		(at 170.138095 124.466667 0)
 		(layer "F.SilkS" knockout)
 		(uuid "93d46163-8f55-48fc-aae6-012904643072")
@@ -26336,8 +26336,8 @@
 			(justify left bottom)
 		)
 	)
-	(gr_text "5V"
-		(at 127.7 63 0)
+	(gr_text "GND"
+		(at 126.6 63 0)
 		(layer "F.SilkS")
 		(uuid "b4be87e2-fa6b-489b-8d49-ee872e355b8e")
 		(effects
