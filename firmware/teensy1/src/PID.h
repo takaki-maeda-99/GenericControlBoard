@@ -1,13 +1,12 @@
 #pragma once
 
-#include <Arduino.h>
-#include <algorithm>   // clamp, min, max などが入っている
+// #include <algorithm>   // clamp, min, max などが入っている
 
-class SimplePID {
+class Pid {
 public:
-  SimplePID(float kp, float ki, float kd,
-            float outMin = -255.0f, float outMax = 255.0f,
-            uint32_t sampleMs = 1)
+  Pid(float kp, float ki, float kd,
+      float outMin = -255.0f, float outMax = 255.0f,
+      uint32_t sampleMs = 1)
   {
     _kp = kp;
     _ki = ki;
