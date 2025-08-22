@@ -14,7 +14,7 @@
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> can2;
-DjiMotorCan motors(can2);
+DjiMotorCan motors(can2, 72.0f);  // 72:1 ギア比で初期化
 
 volatile int state = 0;
 volatile int buttons = 0;
@@ -38,20 +38,35 @@ uint8_t myBoardId = 1;
 
 enum systemMode{
   MANUAL = 0,
-  AUTO = 1
+  AUTO = 1,
+  HOMING = 2
 } mode = AUTO;
+
+enum homingState{
+  NOT_HOMED = 0,
+  HOMING_IN_PROGRESS = 1,
+  HOMED = 2
+};
+
+struct SteerHoming {
+  homingState state;
+  bool completed;
+  float homeAngle;
+} steerHoming[4];
+
+const float homeAngles[4] = {PI/2.0f, 0.0f, -PI/2.0f, PI};
 
 
 bool SerialRead(){
-  if(Serial4.available()) {
+    if(Serial4.available()) {
     String data = Serial4.readStringUntil('\n');
 
     int values[8];
     int index = 0;
     char* token = strtok(data.c_str(), ",");
     while(token && index < 8) {
-      values[index++] = atoi(token);
-      token = strtok(NULL, ",");
+        values[index++] = atoi(token);
+        token = strtok(NULL, ",");
     }
     
     // Update global variables
@@ -73,9 +88,25 @@ bool SerialRead(){
     button.share    = (values[1] & (1 << 8))!= 0;
     button.options  = (values[1] & (1 << 9))!= 0;
 
+
+    Serial.print("left_x: ");
+    Serial.print(lx);
+    Serial.print(", left_y: ");
+    Serial.print(ly);
+    Serial.print(", right_x: ");
+    Serial.print(rx);
+    Serial.print(", right_y: ");
+    Serial.print(ry);
+    Serial.print(", l2: ");
+    Serial.print(l2);
+    Serial.print(", r2: ");
+    Serial.print(r2);
+    Serial.print(", buttons: ");
+    Serial.println(buttons, BIN);
+
     return true;
-  }
-  return false;
+    }
+    return false;
 }
 
 // フレーム1: state + mode + スティック（6バイト）
@@ -93,44 +124,45 @@ struct ControllerFrame2 {
 } __attribute__((packed));
 
 void sendControllerDataToCAN() {
-  CAN_message_t msg;
-  
-  // フレーム1: state + mode + スティック（ID: 0x100）
-  msg.id = 0x100;
-  msg.len = 6;
-  
-  ControllerFrame1 frame1;
-  frame1.state = (uint8_t)state;
-  frame1.mode = (uint8_t)mode;
-  frame1.lx = (int8_t)lx;
-  frame1.ly = (int8_t)ly;
-  frame1.rx = (int8_t)rx;
-  frame1.ry = (int8_t)ry;
-  
-  memcpy(msg.buf, &frame1, sizeof(frame1));
-  can1.write(msg);
-  
-  // フレーム2: ボタン + トリガー（ID: 0x101）
-  msg.id = 0x101;
-  msg.len = 4;
-  
-  ControllerFrame2 frame2;
-  frame2.buttons = (uint16_t)buttons;
-  frame2.l2 = (uint8_t)l2;
-  frame2.r2 = (uint8_t)r2;
-  
-  memcpy(msg.buf, &frame2, sizeof(frame2));
-  can1.write(msg);
+    CAN_message_t msg;
+    
+    // フレーム1: state + mode + スティック（ID: 0x100）
+    msg.id = 0x100;
+    msg.len = 6;
+    
+    ControllerFrame1 frame1;
+    frame1.state = (uint8_t)state;
+    frame1.mode = (uint8_t)mode;
+    frame1.lx = (int8_t)lx;
+    frame1.ly = (int8_t)ly;
+    frame1.rx = (int8_t)rx;
+    frame1.ry = (int8_t)ry;
+    
+    memcpy(msg.buf, &frame1, sizeof(frame1));
+    can1.write(msg);
+    
+    // フレーム2: ボタン + トリガー（ID: 0x101）
+    msg.id = 0x101;
+    msg.len = 4;
+    
+    ControllerFrame2 frame2;
+    frame2.buttons = (uint16_t)buttons;
+    frame2.l2 = (uint8_t)l2;
+    frame2.r2 = (uint8_t)r2;
+    
+    memcpy(msg.buf, &frame2, sizeof(frame2));
+    can1.write(msg);
 }
 
 struct PidParam {
     float kp, ki, kd;
-    int16_t outMin, outMax;
+    float outMin, outMax;
     uint32_t sampleMs;
 };
 
-constexpr PidParam AnglePidParam{200, 0, 0, -10000, 10000, 10};
-constexpr PidParam SpeedPidParam{10,  0, 0, -10000, 10000, 1};
+
+constexpr PidParam AnglePidParam{30, 0, 0, -22.0, 22.0, 10};
+constexpr PidParam SpeedPidParam{1500, 0, 0, -8000, 8000, 1};
 
 // 使い回すときに feed できるユーティリティ
 inline Pid makePID(const PidParam &p) {
@@ -144,7 +176,7 @@ Pid SpeedPid[4] = { makePID(SpeedPidParam), makePID(SpeedPidParam), makePID(Spee
 #define PI 3.14159265358979323846
 
 inline void angleControl(size_t idx, float targetAngle, bool bounded) {
-    const auto &fb = motors.feedback(idx);
+    const auto &fb = motors.feedback(idx + 1);
     const float fbAngle = fb.getAngleRadiansWrapped();
     const float fbSpeed = fb.getSpeedRadiansPerSec();
 
@@ -169,7 +201,7 @@ inline void angleControl(size_t idx, float targetAngle, bool bounded) {
 }
 
 inline void speedControl(size_t idx, float targetSpeed) {
-    const auto &fb = motors.feedback(idx);
+    const auto &fb = motors.feedback(idx + 1);
 
     int16_t speedCmd = SpeedPid[idx].compute(fb.getSpeedRadiansPerSec(), targetSpeed);
     motors.sendCurrent(idx + 1, speedCmd);
@@ -223,6 +255,20 @@ bool parseMotorCommand(const CAN_message_t &msg, MotorCommand &cmd) {
     return true;
 }
 
+bool readLimitSwitches(uint8_t steerIndex) {
+    uint8_t lsPin1, lsPin2;
+    
+    switch(steerIndex) {
+        case 0: lsPin1 = LSPIN11; lsPin2 = LSPIN12; break;
+        case 1: lsPin1 = LSPIN21; lsPin2 = LSPIN22; break;
+        case 2: lsPin1 = LSPIN31; lsPin2 = LSPIN32; break;
+        case 3: lsPin1 = LSPIN41; lsPin2 = LSPIN42; break;
+        default: return false;
+    }
+    
+    return digitalRead(lsPin1) && digitalRead(lsPin2);
+}
+
 static void handleMotorCommand(const CAN_message_t &msg) {
     MotorCommand cmd;
     if (parseMotorCommand(msg, cmd)) {
@@ -252,6 +298,144 @@ float convertToFloat(int32_t value) {
     return (float)value / 1000.0f;
 }
 
+void initializeHoming() {
+    for (uint8_t i = 0; i < 4; i++) {
+        steerHoming[i].state = NOT_HOMED;
+        steerHoming[i].completed = false;
+        steerHoming[i].homeAngle = homeAngles[i];
+    }
+}
+
+void homingControl() {
+    static uint32_t lastUpdate = 0;
+    uint32_t now = millis();
+    
+    if (now - lastUpdate < 10) return;
+    lastUpdate = now;
+    
+    bool allHomed = true;
+    
+    for (uint8_t i = 0; i < 4; i++) {
+        MotorCommand &cmd = motorCommands[i];
+        
+        switch (steerHoming[i].state) {
+            case NOT_HOMED:
+                if (readLimitSwitches(i)) {
+                    steerHoming[i].state = HOMED;
+                } else {
+                    steerHoming[i].state = HOMING_IN_PROGRESS;
+                }
+                allHomed = false;
+                break;
+                
+            case HOMING_IN_PROGRESS:
+                if (readLimitSwitches(i)) {
+                    motors.resetAngle(i + 1, steerHoming[i].homeAngle);
+                    steerHoming[i].state = HOMED;
+                    steerHoming[i].completed = true;
+                    cmd.motorId = i + 1;
+                    cmd.mode = 0x03; // UnboundedAngle
+                    cmd.opt = 0;
+                    cmd.value = 0;
+                    cmd.seq = 0xFE;
+                    cmd.timeout = 10;
+                    cmd.lastUpdate = now;
+                } else {
+                    cmd.motorId = i + 1;
+                    cmd.mode = 0x01; // Speed control
+                    cmd.opt = 0;
+                    cmd.value = (int32_t)(10.0f * 1000.0f); // 10 rad/s
+                    cmd.seq = 0xFE;
+                    cmd.timeout = 10;
+                    cmd.lastUpdate = now;
+                }
+                allHomed = false;
+                break;
+                
+            case HOMED:
+                cmd.motorId = i + 1;
+                cmd.mode = 0x03; // UnboundedAngle
+                cmd.opt = 0;
+                cmd.value = 0;
+                cmd.seq = 0xFE;
+                cmd.timeout = 10;
+                cmd.lastUpdate = now;
+                break;
+        }
+    }
+    
+    if (allHomed) {
+        mode = AUTO;
+    }
+}
+
+void sendWheelCANCommand(uint8_t motorId, float speed_rad_s) {
+    CAN_message_t msg;
+    msg.id = (2 << 4) | motorId; // Board2 (teensy2) Motor1-4 → 0x021-0x024
+    msg.len = 8;
+    
+    static uint8_t seq = 0;
+    int32_t intValue = (int32_t)(speed_rad_s * 1000.0f); // 1000倍スケール
+    
+    msg.buf[0] = 0x01; // Speed control
+    msg.buf[1] = 0x00; // OPT
+    msg.buf[2] = intValue & 0xFF;
+    msg.buf[3] = (intValue >> 8) & 0xFF;
+    msg.buf[4] = (intValue >> 16) & 0xFF;
+    msg.buf[5] = (intValue >> 24) & 0xFF;
+    msg.buf[6] = seq++;
+    msg.buf[7] = 10; // 100ms timeout
+    
+    can1.write(msg);
+}
+
+void manualControl() {
+    // マニュアルモード時のモーターコマンド直接制御
+    static uint32_t lastUpdate = 0;
+    uint32_t now = millis();
+    
+    // 10ms間隔で更新
+    if (now - lastUpdate < 10) return;
+    lastUpdate = now;
+    
+    const float half_length = 0.25f;   // 単位[m]（例）
+    const float half_width  = 0.25f;   // 単位[m]（例） 
+
+    // ホイール・ステアリング共通の計算
+    float wheelX[4] = { +half_length, -half_length, -half_length, +half_length };
+    float wheelY[4] = { +half_width,  +half_width,  -half_width,  -half_width  };
+
+    // スティック値を正規化 (-127~127 → -1.0~1.0)
+    float vx = lx / 127.0f;    // 前後方向
+    float vy = ly / 127.0f;    // 左右方向  
+    float omega = -4 * rx / 127.0f; // 旋回
+
+    for (uint8_t i = 0; i < 4; i++) {
+        float vx_i = vx - omega * wheelY[i];
+        float vy_i = vy + omega * wheelX[i];
+        
+        // ステアリング角度計算
+        float steering_input = atan2(vx_i, vy_i);
+        
+        // ホイール速度計算 (ベクトルの内積で方向決定)
+        float wheel_speed = sqrt(vx_i * vx_i + vy_i * vy_i); // ホイール速度の大きさ
+
+
+        // ステアリング制御 (teensy1のモーター1-4)
+        MotorCommand &cmd = motorCommands[i];
+        cmd.motorId = i + 1;
+        cmd.mode = 0x03; // UnboundedAngle
+        cmd.opt = 0;
+        cmd.value = (int32_t)(steering_input * 1000.0f); // 1000倍スケール
+        cmd.seq = 0xFF; // マニュアルモード識別用
+        cmd.timeout = 10; // 100ms
+        cmd.lastUpdate = now;
+        
+        // ホイール制御 (teensy2へのCANコマンド送信)
+        sendWheelCANCommand(i + 1, wheel_speed * 40.0f); // 速度倍率適用
+    }
+}
+
 void motorControlISR() {
     for (uint8_t i = 0; i < 4; i++) { // モーター1-4のみ制御
         const MotorCommand &cmd = motorCommands[i];
@@ -270,15 +454,15 @@ void motorControlISR() {
                 break;
                 
             case 0x01: // Speed control [rad/s]
-                speedControl(i + 1, value);
+                speedControl(i, value);
                 break;
                 
             case 0x02: // BoundedAngle control [rad]
-                angleControl(i + 1, value, true);
+                angleControl(i, value, true);
                 break;
                 
             case 0x03: // UnboundedAngle control [rad]
-                angleControl(i + 1, value, false);
+                angleControl(i, value, false);
                 break;
                 
             default:
@@ -291,7 +475,6 @@ void motorControlISR() {
 }
 
 
-
 // DIPスイッチピン定義 (ID設定用)
 #define DIP_PIN1 12
 #define DIP_PIN2 13
@@ -299,8 +482,8 @@ void motorControlISR() {
 uint8_t readBoardId() {
     // DIPスイッチから2bitでboard ID (1-4)を読み取り
     uint8_t id = 0;
-    if (digitalRead(DIP_PIN1)) id |= 1;
-    if (digitalRead(DIP_PIN2)) id |= 2;
+    if (!digitalRead(DIP_PIN1)) id += 1;
+    if (!digitalRead(DIP_PIN2)) id += 2;
     return id + 1; // 0-3 → 1-4
 }
 
@@ -312,10 +495,11 @@ void setup() {
   // DIPスイッチピン設定
   pinMode(DIP_PIN1, INPUT_PULLUP);
   pinMode(DIP_PIN2, INPUT_PULLUP);
-  
-  // Board ID読み取り
+
+  delay(100);
+// Board ID読み取り
   myBoardId = readBoardId();
-  Serial.printf("Board ID: %d\n", myBoardId);
+  Serial.printf("Board ID: %d\n", myBoardId);  
   
   can1.begin();
   can1.setBaudRate(500000);
@@ -335,6 +519,9 @@ void setup() {
   pinMode(LSPIN32, INPUT_PULLUP);
   pinMode(LSPIN41, INPUT_PULLUP);
   pinMode(LSPIN42, INPUT_PULLUP);
+
+  initializeHoming();
+  mode = HOMING;
 }
 
 
@@ -343,17 +530,21 @@ void loop() {
     sendControllerDataToCAN();
     if(button.options) mode = MANUAL;
     if(button.share) mode = AUTO;
+    if(button.triangle) {
+        initializeHoming();
+        mode = HOMING;
+    }
   }
   switch (mode) {
     case MANUAL:
-      Serial.println("Manual Mode");
-      // Manual mode logic here
+      manualControl();
       break;
     case AUTO:
-      Serial.println("Auto Mode");
       // Auto mode logic here
       break;
+    case HOMING:
+      homingControl();
+      break;
   }
-  
-  delay(50);
+  delay(10);
 }
