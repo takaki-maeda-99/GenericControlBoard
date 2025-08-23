@@ -26,7 +26,7 @@ struct buttons_t {
 
 uint8_t myBoardId = 3; // teensy3 Board ID = 3
 
-const float homeAngles[4] = {-PI,-PI,-PI,-PI};
+const float homeAngles[4] = {-PI+0.05,-PI+0.05,-PI+0.05,-PI};
 
 // Homing state management
 enum HomingState {
@@ -38,17 +38,11 @@ enum HomingState {
 struct HomingData {
     HomingState state;
     uint32_t startTime;
-    float lastSpeed;
-    uint32_t stallTime;
-    bool isStalled;
 } homingData[4];
 
 // Homing parameters
-const float HOMING_SPEED = -0.5f;        // rad/s (negative = reverse)
-const int16_t HOMING_CURRENT = -1000;    // mA (low torque)
-const uint32_t HOMING_TIMEOUT = 5000;    // ms
-const float STALL_SPEED_THRESHOLD = 0.1f; // rad/s
-const uint32_t STALL_DETECTION_TIME = 200; // ms
+const int16_t HOMING_CURRENT = -1500;        // mA (negative direction)
+const uint32_t HOMING_TIME = 2000;          // ms (time to apply current)
 
 // Frame 1: state + mode + sticks (6 bytes)
 struct ControllerFrame1 {
@@ -84,14 +78,16 @@ struct PidParam {
 };
 
 // Motor PID parameters
-constexpr PidParam MotorSpeedPidParam{800, 10, 0, -14000, 14000, 1};
+constexpr PidParam MotorAnglePidParam{20, 0, 0, -30, 30, 10};     // Angle->Speed cascade
+constexpr PidParam MotorSpeedPidParam{500, 0, 0, -8000, 8000, 1};  // Speed->Current
 
 // Utility function for PID creation
 inline Pid makePID(const PidParam &p) {
     return Pid(p.kp, p.ki, p.kd, p.outMin, p.outMax, p.sampleMs);
 }
 
-// PID object array (4 motors)
+// PID object arrays (4 motors each)
+Pid MotorAnglePid[4] = { makePID(MotorAnglePidParam), makePID(MotorAnglePidParam), makePID(MotorAnglePidParam), makePID(MotorAnglePidParam)};
 Pid MotorSpeedPid[4] = { makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam)};
 
 #define PI 3.14159265358979323846
@@ -103,25 +99,51 @@ inline void motorSpeedControl(size_t idx, float targetSpeed) {
     motors.sendCurrent(idx + 1, speedCmd);
 }
 
+inline void motorAngleControl(size_t idx, float targetAngle, bool bounded) {
+    const auto &fb = motors.feedback(idx + 1);
+    const float fbAngle = fb.getAngleRadiansWrapped();
+    const float fbSpeed = fb.getSpeedRadiansPerSec();
+    
+    if (bounded) {
+        // Bounded angle: clamp target to -π ~ +π
+        targetAngle = constrain(targetAngle, -PI, PI);
+    } else {
+        // Unbounded angle: adjust target for shortest path
+        if (targetAngle - fbAngle > PI) {
+            targetAngle -= 2*PI;
+        } else if (targetAngle - fbAngle < -PI) {
+            targetAngle += 2*PI;
+        }
+    }
+    
+    // Cascade control: Angle->Speed->Current
+    float targetSpeed = MotorAnglePid[idx].compute(fbAngle, targetAngle);
+    int16_t speedCmd = MotorSpeedPid[idx].compute(fbSpeed, targetSpeed);
+    
+    motors.sendCurrent(idx + 1, speedCmd);
+}
+
 void initializeHoming() {
     for (int i = 0; i < 4; i++) {
         homingData[i].state = HOMING_IDLE;
         homingData[i].startTime = 0;
-        homingData[i].lastSpeed = 0;
-        homingData[i].stallTime = 0;
-        homingData[i].isStalled = false;
     }
 }
 
 void startHoming(uint8_t motorIdx) {
     if (motorIdx >= 4) return;
     
+    // Check if motor feedback is available before starting
+    const auto &fb = motors.feedback(motorIdx + 1);
+    if (fb.isTimeout) {
+        Serial.printf("Motor %d: No feedback - cannot start homing\n", motorIdx + 1);
+        return;
+    }
+    
     homingData[motorIdx].state = HOMING_IN_PROGRESS;
     homingData[motorIdx].startTime = millis();
-    homingData[motorIdx].stallTime = 0;
-    homingData[motorIdx].isStalled = false;
     
-    Serial.printf("Starting homing for motor %d\n", motorIdx + 1);
+    Serial.printf("Starting homing for motor %d (feedback confirmed)\n", motorIdx + 1);
 }
 
 bool updateHoming(uint8_t motorIdx) {
@@ -129,43 +151,22 @@ bool updateHoming(uint8_t motorIdx) {
         return false;
     }
     
-    const auto &fb = motors.feedback(motorIdx + 1);
     uint32_t currentTime = millis();
-    float currentSpeed = abs(fb.getSpeedRadiansPerSec());
     
-    // Timeout check
-    if (currentTime - homingData[motorIdx].startTime > HOMING_TIMEOUT) {
-        Serial.printf("Homing timeout for motor %d\n", motorIdx + 1);
-        homingData[motorIdx].state = HOMING_IDLE;
+    // Check if homing time has elapsed
+    if (currentTime - homingData[motorIdx].startTime >= HOMING_TIME) {
+        // Homing complete - stop motor and reset angle to home position
+        Serial.printf("Homing completed for motor %d (time elapsed)\n", motorIdx + 1);
+        
         motors.sendCurrent(motorIdx + 1, 0);
-        return false;
+        motors.resetAngle(motorIdx + 1, homeAngles[motorIdx]);
+        
+        homingData[motorIdx].state = HOMING_COMPLETED;
+        return true;
     }
     
-    // Stall detection (motor stopped moving = hit physical stopper)
-    if (currentSpeed < STALL_SPEED_THRESHOLD) {
-        if (!homingData[motorIdx].isStalled) {
-            homingData[motorIdx].stallTime = currentTime;
-            homingData[motorIdx].isStalled = true;
-        } else if (currentTime - homingData[motorIdx].stallTime > STALL_DETECTION_TIME) {
-            // Motor has been stalled for sufficient time - homing complete
-            Serial.printf("Homing completed for motor %d (stall detected)\n", motorIdx + 1);
-            
-            // Stop motor and reset angle to home position
-            motors.sendCurrent(motorIdx + 1, 0);
-            motors.resetAngle(motorIdx + 1, homeAngles[motorIdx]);
-            
-            homingData[motorIdx].state = HOMING_COMPLETED;
-            return true;
-        }
-    } else {
-        // Motor is still moving, reset stall detection
-        homingData[motorIdx].isStalled = false;
-        homingData[motorIdx].stallTime = 0;
-    }
-    
-    // Continue homing with low torque reverse rotation
+    // Continue applying homing current
     motors.sendCurrent(motorIdx + 1, HOMING_CURRENT);
-    homingData[motorIdx].lastSpeed = currentSpeed;
     
     return false; // Homing still in progress
 }
@@ -234,6 +235,12 @@ static void handleCANMessage(const CAN_message_t &msg) {
     if (parseMotorCommand(msg, cmd)) {
         uint8_t idx = cmd.motorId - 1;  // 0-7 index
         
+        // Allow homing command (0xFF) even if not homed
+        if (cmd.mode != 0xFF && !isHomingComplete(idx)) {
+            Serial.printf("Motor%d: Command blocked - not homed\n", cmd.motorId);
+            return; // Block commands until homing complete
+        }
+        
         // Sequence number check (reject duplicate commands)
         if (cmd.seq == motorCommands[idx].seq && motorCommands[idx].lastUpdate > 0) {
             return; // Ignore same sequence number
@@ -266,6 +273,13 @@ void motorControlISR() {
             continue; // Skip normal command processing during homing
         }
         
+        // Block all commands until homing is complete
+        if (!isHomingComplete(i)) {
+            motors.sendCurrent(i + 1, 0);
+            startHoming(i);
+            continue; // Skip command processing until homed
+        }
+        
         const MotorCommand &cmd = motorCommands[i];
         
         if (!isCommandValid(cmd)) {
@@ -285,12 +299,15 @@ void motorControlISR() {
                 motorSpeedControl(i, value);
                 break;
                 
-            case 0x02: // BoundedAngle control [rad] (not used)
-            case 0x03: // UnboundedAngle control [rad] (not used)
-                motors.sendCurrent(i + 1, 0); // No angle control yet
+            case 0x02: // BoundedAngle control [rad]
+                motorAngleControl(i, value, true);
                 break;
                 
-            case 0xFF: // Special homing command
+            case 0x03: // UnboundedAngle control [rad]
+                motorAngleControl(i, value, false);
+                break;
+                
+            case 0xFF: // Special homing command (always allowed)
                 if (!isHomingComplete(i)) {
                     startHoming(i);
                 }
@@ -333,9 +350,9 @@ void setup() {
   
   // Initialize homing system
   initializeHoming();
-    startHoming(1); // Start homing for motor 1 by default
-    startHoming(2); // Start homing for motor 2 by default
-    startHoming(3); // Start homing for motor 3 by default
+    startHoming(0); // Start homing for motor 1 by default
+    startHoming(1); // Start homing for motor 2 by default
+    startHoming(2); // Start homing for motor 3 by default
 
   can1.begin();
   can1.setBaudRate(500000);
@@ -347,9 +364,9 @@ void setup() {
   motorControlTimer.begin(motorControlISR, 1000);
   motorControlTimer.priority(128);
 
-  motors.setGearRatio(1, 129.56f);
-  motors.setGearRatio(2, 103.18f);
-  motors.setGearRatio(3, 28.66f);
+  motors.setGearRatio(1, 125.0f);
+  motors.setGearRatio(2, 100.0f);
+  motors.setGearRatio(3, 28.0f);
 
   Serial.println("teensy3 (Motor Control with Homing) Ready");
   Serial.println("Send CAN command with mode 0xFF to start homing");

@@ -369,22 +369,22 @@ void homingControl() {
     }
 }
 
-void sendWheelCANCommand(uint8_t motorId, float speed_rad_s) {
+void sendCAN(uint8_t boardId, uint8_t motorId, uint8_t mode, float value, uint8_t timeout = 10) {
     CAN_message_t msg;
-    msg.id = (2 << 4) | motorId; // Board2 (teensy2) Motor1-4 → 0x021-0x024
+    msg.id = (boardId << 4) | motorId; // BoardId + MotorId
     msg.len = 8;
     
     static uint8_t seq = 0;
-    int32_t intValue = (int32_t)(speed_rad_s * 1000.0f); // 1000倍スケール
+    int32_t intValue = (int32_t)(value * 1000.0f); // 1000倍スケール
     
-    msg.buf[0] = 0x01; // Speed control
-    msg.buf[1] = 0x00; // OPT
+    msg.buf[0] = mode;    // Mode (0x01=Speed, 0x02=BoundedAngle, etc.)
+    msg.buf[1] = 0x00;    // OPT
     msg.buf[2] = intValue & 0xFF;
     msg.buf[3] = (intValue >> 8) & 0xFF;
     msg.buf[4] = (intValue >> 16) & 0xFF;
     msg.buf[5] = (intValue >> 24) & 0xFF;
     msg.buf[6] = seq++;
-    msg.buf[7] = 10; // 100ms timeout
+    msg.buf[7] = timeout; // Timeout [10ms units]
     
     can1.write(msg);
 }
@@ -432,8 +432,36 @@ void manualControl() {
         cmd.lastUpdate = now;
         
         // ホイール制御 (teensy2へのCANコマンド送信)
-        sendWheelCANCommand(i + 1, wheel_speed * 40.0f); // 速度倍率適用
+        sendCAN(2, i + 1, 0x01, wheel_speed * 40.0f); // Board2, Speed control
     }
+    
+    // アーム制御 (teensy3へのCANコマンド送信)
+    
+    // circleボタンでアームホーミング開始
+    if (button.circle) {
+        sendCAN(3, 1, 0xFF, 0); // Motor ID 1 homing
+        sendCAN(3, 2, 0xFF, 0); // Motor ID 2 homing  
+        sendCAN(3, 3, 0xFF, 0); // Motor ID 3 homing
+    } else {
+        // 通常のアーム制御
+        // ry → Motor ID 1 (bounded angle control)
+        float ry_angle = (ry / 128.0f)*30; // -π ~ +π rad
+        sendCAN(3, 1, 0x01, ry_angle);
+        
+        // l2 → Motor ID 2 (bounded angle control)
+        // float l2_angle = (l2-128.0f)* PI / 130.0f; // -π ~ +π rad
+        // sendCAN(3, 2, 0x02, l2_angle);
+        
+        // r2 → Motor ID 3 (bounded angle control)
+        float r2_angle = (r2-128.0f)* PI / 130.0f; // -π ~ +π rad
+        sendCAN(3, 3, 0x02, r2_angle);
+    }
+    
+    // l1/r1 → Motor ID 9 (servo) - bounded angle control
+    static float servo_angle = 0.0f;
+    if (button.l1) servo_angle = -PI/2; // -90 degrees
+    if (button.r1) servo_angle = +PI/2; // +90 degrees
+    sendCAN(3, 9, 0x02, servo_angle);
 }
 
 void motorControlISR() {
