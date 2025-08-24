@@ -2,6 +2,7 @@
 #include <IntervalTimer.h>
 #include "DjiMotor.hpp"
 #include "PID.h"
+#include "../../CANMotorControl.h"
 
 #define LSPIN11 2
 #define LSPIN12 3
@@ -14,7 +15,8 @@
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> can2;
-DjiMotorCan motors(can2, 72.0f);  // 72:1 ギア比で初期化
+DjiMotorCan<CAN2> motors(can2, 72.0f);
+CANMotorControl<CAN1> canControl(can1, motors, 1);  // 72:1 ギア比で初期化
 
 volatile int state = 0;
 volatile int buttons = 0;
@@ -63,7 +65,9 @@ bool SerialRead(){
 
     int values[8];
     int index = 0;
-    char* token = strtok(data.c_str(), ",");
+    char dataBuffer[data.length() + 1];
+    data.toCharArray(dataBuffer, data.length() + 1);
+    char* token = strtok(dataBuffer, ",");
     while(token && index < 8) {
         values[index++] = atoi(token);
         token = strtok(NULL, ",");
@@ -173,7 +177,6 @@ inline Pid makePID(const PidParam &p) {
 Pid AnglePid[4] = { makePID(AnglePidParam), makePID(AnglePidParam), makePID(AnglePidParam), makePID(AnglePidParam)};
 Pid SpeedPid[4] = { makePID(SpeedPidParam), makePID(SpeedPidParam), makePID(SpeedPidParam), makePID(SpeedPidParam)};
 
-#define PI 3.14159265358979323846
 
 inline void angleControl(size_t idx, float targetAngle, bool bounded) {
     const auto &fb = motors.feedback(idx + 1);
@@ -207,53 +210,7 @@ inline void speedControl(size_t idx, float targetSpeed) {
     motors.sendCurrent(idx + 1, speedCmd);
 }
 
-struct MotorCommand {
-    uint8_t motorId;     // モーターID (1-8)
-    uint8_t mode;        // 0x00=Disable, 0x01=Speed, 0x02=BoundedAngle, 0x03=UnboundedAngle
-    uint8_t opt;         // 将来拡張/フラグ (現状0固定)
-    int32_t value;       // 指令値 (rad/s または rad)
-    uint8_t seq;         // シーケンス番号 (0-255巡回)
-    uint8_t timeout;     // タイムアウト [10ms単位] (0=ボード既定)
-    uint32_t lastUpdate; // 最終更新時刻 [ms]
-    
-    MotorCommand() : motorId(0), mode(0x00), opt(0), value(0), seq(0), timeout(0), lastUpdate(0) {}
-} __attribute__((packed));
 
-// 各モーターの最新コマンド
-MotorCommand motorCommands[8];
-
-bool parseMotorCommand(const CAN_message_t &msg, MotorCommand &cmd) {
-    // CANメッセージIDから BoardId と MotorId を抽出
-    uint8_t boardId = (msg.id >> 4) & 0x0F;  // 上位4bit
-    uint8_t motorId = msg.id & 0x0F;         // 下位4bit
-    
-    // 自分宛てでない、またはモーターID範囲外
-    if (boardId != myBoardId || motorId < 1 || motorId > 8) {
-        return false;
-    }
-    
-    // CANデータ長チェック
-    if (msg.len < 8) {
-        return false;
-    }
-    
-    // CANメッセージから構造体に変換
-    cmd.motorId = motorId;
-    cmd.mode = msg.buf[0];
-    cmd.opt = msg.buf[1];
-    
-    // int32値をリトルエンディアンで復元
-    cmd.value = (int32_t)msg.buf[2] | 
-                ((int32_t)msg.buf[3] << 8) | 
-                ((int32_t)msg.buf[4] << 16) | 
-                ((int32_t)msg.buf[5] << 24);
-    
-    cmd.seq = msg.buf[6];
-    cmd.timeout = msg.buf[7];
-    cmd.lastUpdate = millis();
-    
-    return true;
-}
 
 bool readLimitSwitches(uint8_t steerIndex) {
     uint8_t lsPin1, lsPin2;
@@ -269,34 +226,9 @@ bool readLimitSwitches(uint8_t steerIndex) {
     return digitalRead(lsPin1) && digitalRead(lsPin2);
 }
 
-static void handleMotorCommand(const CAN_message_t &msg) {
-    MotorCommand cmd;
-    if (parseMotorCommand(msg, cmd)) {
-        uint8_t idx = cmd.motorId - 1;  // 0-7インデックス
-        
-        // シーケンス番号チェック（重複コマンド拒否）
-        if (cmd.seq == motorCommands[idx].seq && motorCommands[idx].lastUpdate > 0) {
-            return; // 同じシーケンス番号は無視
-        }
-        
-        // コマンド更新
-        motorCommands[idx] = cmd;
-    }
-}
 
 IntervalTimer motorControlTimer;
 
-bool isCommandValid(const MotorCommand &cmd) {
-    if (cmd.lastUpdate == 0) return false; // 未初期化
-    
-    uint32_t timeoutMs = (cmd.timeout == 0) ? 100 : (cmd.timeout * 10); // デフォルト100ms
-    return (millis() - cmd.lastUpdate) < timeoutMs;
-}
-
-float convertToFloat(int32_t value) {
-    // int32からfloatへの変換 (固定小数点想定: 1000倍スケール)
-    return (float)value / 1000.0f;
-}
 
 void initializeHoming() {
     for (uint8_t i = 0; i < 4; i++) {
@@ -316,7 +248,6 @@ void homingControl() {
     bool allHomed = true;
     
     for (uint8_t i = 0; i < 4; i++) {
-        MotorCommand &cmd = motorCommands[i];
         
         switch (steerHoming[i].state) {
             case NOT_HOMED:
@@ -333,18 +264,20 @@ void homingControl() {
                     motors.resetAngle(i + 1, steerHoming[i].homeAngle);
                     steerHoming[i].state = HOMED;
                     steerHoming[i].completed = true;
+                    MotorCommand &cmd = canControl.motorCommands[i];
                     cmd.motorId = i + 1;
-                    cmd.mode = 0x03; // UnboundedAngle
+                    cmd.mode = 0x03;
                     cmd.opt = 0;
                     cmd.value = 0;
                     cmd.seq = 0xFE;
                     cmd.timeout = 10;
                     cmd.lastUpdate = now;
                 } else {
+                    MotorCommand &cmd = canControl.motorCommands[i];
                     cmd.motorId = i + 1;
-                    cmd.mode = 0x01; // Speed control
+                    cmd.mode = 0x01;
                     cmd.opt = 0;
-                    cmd.value = (int32_t)(10.0f * 1000.0f); // 10 rad/s
+                    cmd.value = canControl.convertToInt32(10.0f);
                     cmd.seq = 0xFE;
                     cmd.timeout = 10;
                     cmd.lastUpdate = now;
@@ -353,13 +286,16 @@ void homingControl() {
                 break;
                 
             case HOMED:
+                {
+                MotorCommand &cmd = canControl.motorCommands[i];
                 cmd.motorId = i + 1;
-                cmd.mode = 0x03; // UnboundedAngle
+                cmd.mode = 0x03;
                 cmd.opt = 0;
                 cmd.value = 0;
                 cmd.seq = 0xFE;
                 cmd.timeout = 10;
                 cmd.lastUpdate = now;
+                }
                 break;
         }
     }
@@ -369,25 +305,6 @@ void homingControl() {
     }
 }
 
-void sendCAN(uint8_t boardId, uint8_t motorId, uint8_t mode, float value, uint8_t timeout = 10) {
-    CAN_message_t msg;
-    msg.id = (boardId << 4) | motorId; // BoardId + MotorId
-    msg.len = 8;
-    
-    static uint8_t seq = 0;
-    int32_t intValue = (int32_t)(value * 1000.0f); // 1000倍スケール
-    
-    msg.buf[0] = mode;    // Mode (0x01=Speed, 0x02=BoundedAngle, etc.)
-    msg.buf[1] = 0x00;    // OPT
-    msg.buf[2] = intValue & 0xFF;
-    msg.buf[3] = (intValue >> 8) & 0xFF;
-    msg.buf[4] = (intValue >> 16) & 0xFF;
-    msg.buf[5] = (intValue >> 24) & 0xFF;
-    msg.buf[6] = seq++;
-    msg.buf[7] = timeout; // Timeout [10ms units]
-    
-    can1.write(msg);
-}
 
 void manualControl() {
     // マニュアルモード時のモーターコマンド直接制御
@@ -422,31 +339,31 @@ void manualControl() {
 
 
         // ステアリング制御 (teensy1のモーター1-4)
-        MotorCommand &cmd = motorCommands[i];
+        MotorCommand &cmd = canControl.motorCommands[i];
         cmd.motorId = i + 1;
         cmd.mode = 0x03; // UnboundedAngle
         cmd.opt = 0;
-        cmd.value = (int32_t)(steering_input * 1000.0f); // 1000倍スケール
+        cmd.value = canControl.convertToInt32(steering_input);
         cmd.seq = 0xFF; // マニュアルモード識別用
-        cmd.timeout = 10; // 100ms
+        cmd.timeout = 10;
         cmd.lastUpdate = now;
         
         // ホイール制御 (teensy2へのCANコマンド送信)
-        sendCAN(2, i + 1, 0x01, wheel_speed * 40.0f); // Board2, Speed control
+        canControl.sendCAN(2, i + 1, 0x01, wheel_speed * 40.0f);
     }
     
     // アーム制御 (teensy3へのCANコマンド送信)
     
     // circleボタンでアームホーミング開始
     if (button.circle) {
-        sendCAN(3, 1, 0xFF, 0); // Motor ID 1 homing
-        sendCAN(3, 2, 0xFF, 0); // Motor ID 2 homing  
-        sendCAN(3, 3, 0xFF, 0); // Motor ID 3 homing
+        canControl.sendCAN(3, 1, 0xFF, 0);
+        canControl.sendCAN(3, 2, 0xFF, 0);
+        canControl.sendCAN(3, 3, 0xFF, 0);
     } else {
         // 通常のアーム制御
         // ry → Motor ID 1 (bounded angle control)
         float ry_angle = (ry / 128.0f)*30; // -π ~ +π rad
-        sendCAN(3, 1, 0x01, ry_angle);
+        canControl.sendCAN(3, 1, 0x01, ry_angle);
         
         // l2 → Motor ID 2 (bounded angle control)
         // float l2_angle = (l2-128.0f)* PI / 130.0f; // -π ~ +π rad
@@ -454,52 +371,22 @@ void manualControl() {
         
         // r2 → Motor ID 3 (bounded angle control)
         float r2_angle = (r2-128.0f)* PI / 130.0f; // -π ~ +π rad
-        sendCAN(3, 3, 0x02, r2_angle);
+        canControl.sendCAN(3, 3, 0x02, r2_angle);
     }
     
     // l1/r1 → Motor ID 9 (servo) - bounded angle control
     static float servo_angle = 0.0f;
     if (button.l1) servo_angle = -PI/2; // -90 degrees
     if (button.r1) servo_angle = +PI/2; // +90 degrees
-    sendCAN(3, 9, 0x02, servo_angle);
+    canControl.sendCAN(3, 9, 0x02, servo_angle);
 }
 
 void motorControlISR() {
-    for (uint8_t i = 0; i < 4; i++) { // モーター1-4のみ制御
-        const MotorCommand &cmd = motorCommands[i];
-        
-        if (!isCommandValid(cmd)) {
-            // タイムアウト時は停止
-            motors.sendCurrent(i + 1, 0);
-            continue;
-        }
-        
-        float value = convertToFloat(cmd.value);
-        
-        switch (cmd.mode) {
-            case 0x00: // Disable
-                motors.sendCurrent(i + 1, 0);
-                break;
-                
-            case 0x01: // Speed control [rad/s]
-                speedControl(i, value);
-                break;
-                
-            case 0x02: // BoundedAngle control [rad]
-                angleControl(i, value, true);
-                break;
-                
-            case 0x03: // UnboundedAngle control [rad]
-                angleControl(i, value, false);
-                break;
-                
-            default:
-                motors.sendCurrent(i + 1, 0); // 不明なモードは停止
-                break;
-        }
+    for (uint8_t i = 0; i < 4; i++) {
+        canControl.processMotorCommand(i, &AnglePid[i], &SpeedPid[i]);
     }
     
-    motors.flush(); // 全コマンド送信
+    motors.flush();
 }
 
 
@@ -529,11 +416,7 @@ void setup() {
   myBoardId = readBoardId();
   Serial.printf("Board ID: %d\n", myBoardId);  
   
-  can1.begin();
-  can1.setBaudRate(500000);
-  can1.enableFIFO();
-  can1.enableFIFOInterrupt();
-  can1.onReceive(handleMotorCommand);
+  canControl.begin();
   
   // モーター制御タイマー開始 (1kHz = 1000μs間隔)
   motorControlTimer.begin(motorControlISR, 1000);

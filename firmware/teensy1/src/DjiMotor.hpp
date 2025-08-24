@@ -232,6 +232,25 @@ public:
         fb_[idx].updateGearRatio(gearRatio);
     }
     
+    // 全モーターのギア比を一括設定
+    void setGearRatio(float gearRatio) {
+        for (uint8_t i = 0; i < 8; i++) {
+            gearRatios_[i] = gearRatio;
+            fb_[i].updateGearRatio(gearRatio);
+        }
+    }
+    
+    // ギア比取得
+    float getGearRatio() const {
+        return gearRatios_[0]; // 最初のモーターのギア比を返す
+    }
+    
+    // エンコーダカウントを角度(度)に変換
+    float countToDegrees(int32_t count) const {
+        const float conversion = 360.0f / (DjiConstants::ENCODER_CPR * gearRatios_[0]);
+        return count * conversion;
+    }
+    
 private:
     // CAN受信割り込みハンドラ
     static void isr(const CAN_message_t &msg) {

@@ -8,7 +8,7 @@ FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> can2;
 DjiMotorCan<CAN2> motors(can2, 72.0f);  // 72:1 ギア比で初期化
 
 // PID制御器（位置制御用）
-SimplePID posPID(25.0, 0.1, 0.05, -16384, 16384);
+Pid posPID(25.0, 0.1, 0.05, -16384, 16384, 10);
 
 // テスト用変数
 uint32_t lastTestTime = 0;

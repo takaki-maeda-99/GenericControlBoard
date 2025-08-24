@@ -2,10 +2,12 @@
 #include <IntervalTimer.h>
 #include "DjiMotor.hpp"
 #include "PID.h"
+#include "../../CANMotorControl.h"
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> can2;
-DjiMotorCan motors(can2, 129.5f);
+DjiMotorCan<CAN2> motors(can2, 129.5f);
+CANMotorControl<CAN1> canControl(can1, motors, 3);
 
 volatile int state = 0;
 volatile int buttons = 0;
@@ -90,7 +92,7 @@ inline Pid makePID(const PidParam &p) {
 Pid MotorAnglePid[4] = { makePID(MotorAnglePidParam), makePID(MotorAnglePidParam), makePID(MotorAnglePidParam), makePID(MotorAnglePidParam)};
 Pid MotorSpeedPid[4] = { makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam)};
 
-#define PI 3.14159265358979323846
+// PI already defined in Arduino core
 
 inline void motorSpeedControl(size_t idx, float targetSpeed) {
     const auto &fb = motors.feedback(idx + 1);
@@ -176,92 +178,12 @@ bool isHomingComplete(uint8_t motorIdx) {
     return homingData[motorIdx].state == HOMING_COMPLETED;
 }
 
-struct MotorCommand {
-    uint8_t motorId;     // Motor ID (1-8)
-    uint8_t mode;        // 0x00=Disable, 0x01=Speed, 0x02=BoundedAngle, 0x03=UnboundedAngle
-    uint8_t opt;         // Future expansion/flags (currently 0)
-    int32_t value;       // Command value (rad/s or rad)
-    uint8_t seq;         // Sequence number (0-255 cyclic)
-    uint8_t timeout;     // Timeout [10ms units] (0=board default)
-    uint32_t lastUpdate; // Last update time [ms]
-    
-    MotorCommand() : motorId(0), mode(0x00), opt(0), value(0), seq(0), timeout(0), lastUpdate(0) {}
-} __attribute__((packed));
 
-// Latest command for each motor
-MotorCommand motorCommands[8];
 
-bool parseMotorCommand(const CAN_message_t &msg, MotorCommand &cmd) {
-    // Extract BoardId and MotorId from CAN message ID
-    uint8_t boardId = (msg.id >> 4) & 0x0F;  // Upper 4 bits
-    uint8_t motorId = msg.id & 0x0F;         // Lower 4 bits
-    
-    // Not for this board, or motor ID out of range
-    if (boardId != myBoardId || motorId < 1 || motorId > 8) {
-        return false;
-    }
-    
-    // CAN data length check
-    if (msg.len < 8) {
-        return false;
-    }
-    
-    // Convert CAN message to struct
-    cmd.motorId = motorId;
-    cmd.mode = msg.buf[0];
-    cmd.opt = msg.buf[1];
-    
-    // Restore int32 value in little endian
-    cmd.value = (int32_t)msg.buf[2] | 
-                ((int32_t)msg.buf[3] << 8) | 
-                ((int32_t)msg.buf[4] << 16) | 
-                ((int32_t)msg.buf[5] << 24);
-    
-    cmd.seq = msg.buf[6];
-    cmd.timeout = msg.buf[7];
-    cmd.lastUpdate = millis();
-    
-    return true;
-}
 
-float convertToFloat(int32_t value) {
-    // int32 to float conversion (fixed point assumption: 1000x scale)
-    return (float)value / 1000.0f;
-}
-
-static void handleCANMessage(const CAN_message_t &msg) {
-    // Motor command processing only (0x03X)
-    MotorCommand cmd;
-    if (parseMotorCommand(msg, cmd)) {
-        uint8_t idx = cmd.motorId - 1;  // 0-7 index
-        
-        // Allow homing command (0xFF) even if not homed
-        if (cmd.mode != 0xFF && !isHomingComplete(idx)) {
-            Serial.printf("Motor%d: Command blocked - not homed\n", cmd.motorId);
-            return; // Block commands until homing complete
-        }
-        
-        // Sequence number check (reject duplicate commands)
-        if (cmd.seq == motorCommands[idx].seq && motorCommands[idx].lastUpdate > 0) {
-            return; // Ignore same sequence number
-        }
-        
-        // Update command
-        motorCommands[idx] = cmd;
-        
-        Serial.printf("Motor%d: mode=%02X, val=%.3f, seq=%d\n", 
-                     cmd.motorId, cmd.mode, convertToFloat(cmd.value), cmd.seq);
-    }
-}
 
 IntervalTimer motorControlTimer;
 
-bool isCommandValid(const MotorCommand &cmd) {
-    if (cmd.lastUpdate == 0) return false; // Uninitialized
-    
-    uint32_t timeoutMs = (cmd.timeout == 0) ? 100 : (cmd.timeout * 10); // Default 100ms
-    return (millis() - cmd.lastUpdate) < timeoutMs;
-}
 
 // teensy3 manual control via CAN commands
 
@@ -280,15 +202,15 @@ void motorControlISR() {
             continue; // Skip command processing until homed
         }
         
-        const MotorCommand &cmd = motorCommands[i];
+        const MotorCommand &cmd = canControl.motorCommands[i];
         
-        if (!isCommandValid(cmd)) {
+        if (!canControl.isCommandValid(cmd)) {
             // Stop on timeout
             motors.sendCurrent(i + 1, 0);
             continue;
         }
         
-        float value = convertToFloat(cmd.value);
+        float value = canControl.convertToFloat(cmd.value);
         
         switch (cmd.mode) {
             case 0x00: // Disable
@@ -354,11 +276,7 @@ void setup() {
     startHoming(1); // Start homing for motor 2 by default
     startHoming(2); // Start homing for motor 3 by default
 
-  can1.begin();
-  can1.setBaudRate(500000);
-  can1.enableFIFO();
-  can1.enableFIFOInterrupt();
-  can1.onReceive(handleCANMessage);
+  canControl.begin();
   
   // Start motor control timer (1kHz = 1000μs interval)
   motorControlTimer.begin(motorControlISR, 1000);
