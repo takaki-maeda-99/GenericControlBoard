@@ -1,7 +1,8 @@
 #include <FlexCAN_T4.h>
 #include <IntervalTimer.h>
-#include "DjiMotor.hpp"
-#include "PID.h"
+#include "../../lib/DjiMotor.hpp"
+#include "../../lib/PID.h"
+#include "../../lib/HomingController.h"
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> can2;
@@ -28,19 +29,10 @@ uint8_t myBoardId = 3; // teensy3 Board ID = 3
 
 const float homeAngles[4] = {-PI+0.05,-PI+0.05,-PI+0.05,-PI};
 
-// Homing state management
-enum HomingState {
-    HOMING_IDLE,
-    HOMING_IN_PROGRESS,
-    HOMING_COMPLETED
-};
+// 共通ホーミングコントローラー
+HomingController homingController(4, homeAngles);
 
-struct HomingData {
-    HomingState state;
-    uint32_t startTime;
-} homingData[4];
-
-// Homing parameters
+// teensy3固有のホーミングパラメータ
 const int16_t HOMING_CURRENT = -1500;        // mA (negative direction)
 const uint32_t HOMING_TIME = 2000;          // ms (time to apply current)
 
@@ -90,7 +82,7 @@ inline Pid makePID(const PidParam &p) {
 Pid MotorAnglePid[4] = { makePID(MotorAnglePidParam), makePID(MotorAnglePidParam), makePID(MotorAnglePidParam), makePID(MotorAnglePidParam)};
 Pid MotorSpeedPid[4] = { makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam), makePID(MotorSpeedPidParam)};
 
-#define PI 3.14159265358979323846
+// #define PI 3.14159265358979323846  // Already defined by Arduino
 
 inline void motorSpeedControl(size_t idx, float targetSpeed) {
     const auto &fb = motors.feedback(idx + 1);
@@ -124,56 +116,38 @@ inline void motorAngleControl(size_t idx, float targetAngle, bool bounded) {
 }
 
 void initializeHoming() {
-    for (int i = 0; i < 4; i++) {
-        homingData[i].state = HOMING_IDLE;
-        homingData[i].startTime = 0;
-    }
-}
-
-void startHoming(uint8_t motorIdx) {
-    if (motorIdx >= 4) return;
+    homingController.initialize();
     
-    // Check if motor feedback is available before starting
-    const auto &fb = motors.feedback(motorIdx + 1);
-    if (fb.isTimeout) {
-        Serial.printf("Motor %d: No feedback - cannot start homing\n", motorIdx + 1);
-        return;
-    }
-    
-    homingData[motorIdx].state = HOMING_IN_PROGRESS;
-    homingData[motorIdx].startTime = millis();
-    
-    Serial.printf("Starting homing for motor %d (feedback confirmed)\n", motorIdx + 1);
-}
-
-bool updateHoming(uint8_t motorIdx) {
-    if (motorIdx >= 4 || homingData[motorIdx].state != HOMING_IN_PROGRESS) {
-        return false;
-    }
-    
-    uint32_t currentTime = millis();
-    
-    // Check if homing time has elapsed
-    if (currentTime - homingData[motorIdx].startTime >= HOMING_TIME) {
-        // Homing complete - stop motor and reset angle to home position
-        Serial.printf("Homing completed for motor %d (time elapsed)\n", motorIdx + 1);
+    // teensy3固有のホーミング手順設定（時間ベース）
+    homingController.setProcedureCallback([](uint8_t idx, DjiMotorCan<CAN2> &motors) {
+        static uint32_t startTimes[4] = {0};
         
-        motors.sendCurrent(motorIdx + 1, 0);
-        motors.resetAngle(motorIdx + 1, homeAngles[motorIdx]);
+        // 初回実行時に開始時刻を記録
+        if (startTimes[idx] == 0) {
+            // モーターフィードバックが利用可能かチェック
+            const auto &fb = motors.feedback(idx + 1);
+            if (fb.isTimeout) {
+                Serial.printf("Motor %d: No feedback - cannot start homing\n", idx + 1);
+                return true; // エラーとして完了扱い
+            }
+            
+            startTimes[idx] = millis();
+            Serial.printf("Starting homing for motor %d (feedback confirmed)\n", idx + 1);
+        }
         
-        homingData[motorIdx].state = HOMING_COMPLETED;
-        return true;
-    }
-    
-    // Continue applying homing current
-    motors.sendCurrent(motorIdx + 1, HOMING_CURRENT);
-    
-    return false; // Homing still in progress
-}
-
-bool isHomingComplete(uint8_t motorIdx) {
-    if (motorIdx >= 4) return false;
-    return homingData[motorIdx].state == HOMING_COMPLETED;
+        uint32_t currentTime = millis();
+        
+        // ホーミング時間チェック
+        if (currentTime - startTimes[idx] >= HOMING_TIME) {
+            // ホーミング完了
+            startTimes[idx] = 0; // リセット
+            return true;
+        }
+        
+        // ホーミング用電流印加
+        motors.sendCurrent(idx + 1, HOMING_CURRENT);
+        return false; // 継続中
+    });
 }
 
 struct MotorCommand {
@@ -236,7 +210,7 @@ static void handleCANMessage(const CAN_message_t &msg) {
         uint8_t idx = cmd.motorId - 1;  // 0-7 index
         
         // Allow homing command (0xFF) even if not homed
-        if (cmd.mode != 0xFF && !isHomingComplete(idx)) {
+        if (cmd.mode != 0xFF && !homingController.isHomingComplete(idx)) {
             Serial.printf("Motor%d: Command blocked - not homed\n", cmd.motorId);
             return; // Block commands until homing complete
         }
@@ -266,18 +240,19 @@ bool isCommandValid(const MotorCommand &cmd) {
 // teensy3 manual control via CAN commands
 
 void motorControlISR() {
+    // まずホーミング処理を実行
+    homingController.update(motors);
+    
     for (uint8_t i = 0; i < 4; i++) { // Control motors 1-4 only
-        // Check if homing is in progress for this motor
-        if (homingData[i].state == HOMING_IN_PROGRESS) {
-            updateHoming(i);
-            continue; // Skip normal command processing during homing
+        // ホーミング中はコマンド処理をスキップ
+        if (homingController.getState(i) == HOMING_IN_PROGRESS) {
+            continue;
         }
         
-        // Block all commands until homing is complete
-        if (!isHomingComplete(i)) {
+        // ホーミング未完了の場合は停止
+        if (!homingController.isHomingComplete(i)) {
             motors.sendCurrent(i + 1, 0);
-            startHoming(i);
-            continue; // Skip command processing until homed
+            continue;
         }
         
         const MotorCommand &cmd = motorCommands[i];
@@ -308,9 +283,7 @@ void motorControlISR() {
                 break;
                 
             case 0xFF: // Special homing command (always allowed)
-                if (!isHomingComplete(i)) {
-                    startHoming(i);
-                }
+                homingController.handleHomingCommand(i);
                 break;
                 
             default:
@@ -350,9 +323,7 @@ void setup() {
   
   // Initialize homing system
   initializeHoming();
-    startHoming(0); // Start homing for motor 1 by default
-    startHoming(1); // Start homing for motor 2 by default
-    startHoming(2); // Start homing for motor 3 by default
+  homingController.startAllHoming(); // Start homing for all motors
 
   can1.begin();
   can1.setBaudRate(500000);
