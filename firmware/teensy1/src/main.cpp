@@ -3,7 +3,6 @@
 #include "../../lib/DjiMotor.hpp"
 #include "../../lib/PID.h"
 #include "../../lib/CanMotorController.h"
-#include "../../lib/HomingController.h"
 
 #define LSPIN11 2
 #define LSPIN12 3
@@ -44,9 +43,6 @@ CanMotorController motorController(1, motors, 4); // Board ID=1, 4モーター
 
 const float homeAngles[4] = {PI/2.0f, 0.0f, -PI/2.0f, PI};
 
-// 共通ホーミングコントローラー
-HomingController homingController(4, homeAngles);
-
 // コントローラーデータ読み取り関数
 bool SerialRead(){
     if(Serial4.available()) {
@@ -81,21 +77,6 @@ bool SerialRead(){
     button.r1       = (values[1] & (1 << 5))!= 0;
     button.share    = (values[1] & (1 << 8))!= 0;
     button.options  = (values[1] & (1 << 9))!= 0;
-
-    Serial.print("left_x: ");
-    Serial.print(lx);
-    Serial.print(", left_y: ");
-    Serial.print(ly);
-    Serial.print(", right_x: ");
-    Serial.print(rx);
-    Serial.print(", right_y: ");
-    Serial.print(ry);
-    Serial.print(", l2: ");
-    Serial.print(l2);
-    Serial.print(", r2: ");
-    Serial.print(r2);
-    Serial.print(", buttons: ");
-    Serial.println(buttons, BIN);
 
     return true;
     }
@@ -203,18 +184,32 @@ inline void speedControl(size_t idx, float targetSpeed, DjiMotorCan<CAN2> &motor
 }
 
 
-bool readLimitSwitches(uint8_t steerIndex) {
-    uint8_t lsPin1, lsPin2;
+bool readLimitSwitch1(uint8_t steerIndex) {
+    uint8_t lsPin1;
     
     switch(steerIndex) {
-        case 0: lsPin1 = LSPIN11; lsPin2 = LSPIN12; break;
-        case 1: lsPin1 = LSPIN21; lsPin2 = LSPIN22; break;
-        case 2: lsPin1 = LSPIN31; lsPin2 = LSPIN32; break;
-        case 3: lsPin1 = LSPIN41; lsPin2 = LSPIN42; break;
+        case 0: lsPin1 = LSPIN11; break;
+        case 1: lsPin1 = LSPIN21; break;
+        case 2: lsPin1 = LSPIN31; break;
+        case 3: lsPin1 = LSPIN41; break;
         default: return false;
     }
     
-    return digitalRead(lsPin1) && digitalRead(lsPin2);
+    return digitalRead(lsPin1);
+}
+
+bool readLimitSwitch2(uint8_t steerIndex) {
+    uint8_t lsPin2;
+    
+    switch(steerIndex) {
+        case 0: lsPin2 = LSPIN12; break;
+        case 1: lsPin2 = LSPIN22; break;
+        case 2: lsPin2 = LSPIN32; break;
+        case 3: lsPin2 = LSPIN42; break;
+        default: return false;
+    }
+    
+    return digitalRead(lsPin2);
 }
 
 // CANメッセージハンドラー
@@ -224,33 +219,6 @@ static void handleMotorCommand(const CAN_message_t &msg) {
 
 IntervalTimer motorControlTimer;
 
-
-void initializeHoming() {
-    homingController.initialize();
-    
-    // teensy1固有のホーミング手順設定
-    homingController.setProcedureCallback([](uint8_t idx, DjiMotorCan<CAN2> &motors) {
-        if (readLimitSwitches(idx)) {
-            // リミットスイッチに到達 -> ホーミング完了
-            return true;
-        } else {
-            // ホーミング用電流印加
-            motors.sendCurrent(idx + 1, 1000);
-            return false;
-        }
-    });
-}
-
-void homingControl() {
-    static uint32_t lastUpdate = 0;
-    uint32_t now = millis();
-    
-    if (now - lastUpdate < 10) return;
-    lastUpdate = now;
-    
-    // 共通ホーミング処理実行
-    homingController.update(motors);
-}
 
 void sendCAN(uint8_t boardId, uint8_t motorId, uint8_t mode, float value, uint8_t timeout = 10) {
     CAN_message_t msg;
@@ -289,6 +257,46 @@ uint8_t readBoardId() {
     if (!digitalRead(DIP_PIN1)) id += 1;
     if (!digitalRead(DIP_PIN2)) id += 2;
     return id + 1; // 0-3 → 1-4
+}
+
+void homing(){
+    // ホーミング中はモーターコントロール割込みを停止
+    motorControlTimer.end();
+    
+    bool homingComplete[4] = {false};
+    while(!homingComplete[0] || !homingComplete[1] || !homingComplete[2] || !homingComplete[3]) {
+    // 無限ループ
+        for(int i=0; i<4; i++) {
+            bool ls1 = readLimitSwitch1(i);
+            bool ls2 = readLimitSwitch2(i);
+
+            homingComplete[i] = false;
+            if(ls1 && ls2) {
+                // 両方のスイッチが押されたらホーミング完了
+                motors.resetAngle(i+1, homeAngles[i]);
+                speedControl(i, 0, motors);
+                homingComplete[i] = true;
+            }
+            else if(ls1) {
+                // スイッチ1が押されたらホーミング中
+                speedControl(i, 3, motors);
+            }
+            else{
+                // スイッチ2が押されたらホーミング中
+                speedControl(i, 20, motors);
+            }
+        }
+        motors.flush();
+        Serial.print(homingComplete[0]);
+        Serial.print(homingComplete[1]);
+        Serial.print(homingComplete[2]);
+        Serial.println(homingComplete[3]);
+        delay(1);
+    }
+    
+    // ホーミング完了後、モーターコントロール割込みを再開
+    motorControlTimer.begin(motorControlISR, 1000);
+    motorControlTimer.priority(128);
 }
 
 
@@ -336,7 +344,7 @@ void setup() {
               break;
               
           case 0xFF: // Homing command
-              homingController.handleHomingCommand(idx);
+              homing();
               break;
               
           default:
@@ -344,10 +352,6 @@ void setup() {
               break;
       }
   });
-  
-  // モーター制御タイマー開始 (1kHz = 1000μs間隔)
-  motorControlTimer.begin(motorControlISR, 1000);
-  motorControlTimer.priority(128);
 
   pinMode(LSPIN11, INPUT_PULLUP);
   pinMode(LSPIN12, INPUT_PULLUP);
@@ -358,12 +362,12 @@ void setup() {
   pinMode(LSPIN41, INPUT_PULLUP);
   pinMode(LSPIN42, INPUT_PULLUP);
 
-  initializeHoming();
-  
-  Serial.println("teensy1 (Steering Control) Ready - CAN commands only");
-  
-  // ホーミング状態表示
-  homingController.printStatus();
+// モーター制御タイマー開始 (1kHz = 1000μs間隔)
+  motorControlTimer.begin(motorControlISR, 1000);
+  motorControlTimer.priority(128);
+
+  homing();
+
 }
 
 
@@ -372,15 +376,11 @@ void loop() {
   if(SerialRead()) {
     sendControllerDataToCAN();
     
-    // triangleボタンでホーミング再実行
+    // triangleボタンでホーミング再実行（削除）
     if(button.triangle) {
-        homingController.startAllHoming();
         Serial.println("Homing restart requested");
     }
   }
-  
-  // ホーミング処理（0xFFコマンドで起動されたときのみ実行）
-  homingControl();
   
   delay(10);
 }
