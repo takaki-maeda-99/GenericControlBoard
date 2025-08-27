@@ -115,9 +115,9 @@ void encoderY_ISR() {
     
     // A相の変化でカウント、B相の状態で方向判定
     if (stateA == stateB) {
-        encoderY_count--;
-    } else {
         encoderY_count++;
+    } else {
+        encoderY_count--;
     }
 }
 

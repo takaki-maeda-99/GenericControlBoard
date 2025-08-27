@@ -270,8 +270,7 @@ void homing(){
             bool ls1 = readLimitSwitch1(i);
             bool ls2 = readLimitSwitch2(i);
 
-            homingComplete[i] = false;
-            if(ls1 && ls2) {
+            if((ls1 && ls2) || homingComplete[i] ) {
                 // 両方のスイッチが押されたらホーミング完了
                 motors.resetAngle(i+1, homeAngles[i]);
                 speedControl(i, 0, motors);
@@ -367,6 +366,7 @@ void setup() {
   motorControlTimer.priority(128);
 
   homing();
+  motorController.setDebugOutput(true);
 
 }
 
