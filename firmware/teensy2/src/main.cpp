@@ -18,28 +18,10 @@ DjiMotorCan<CAN2> motors(can2, 3591.0f/187.0f);
 #define ODOMETRY_Y_ENCODER_A_PIN 4
 #define ODOMETRY_Y_ENCODER_B_PIN 5
 
-// コントローラ入力データ
-volatile int state = 0;
-volatile int buttons = 0;
-volatile int lx = 0, ly = 0;
-volatile int rx = 0, ry = 0;
-volatile int l2 = 0, r2 = 0;
-
-struct buttons_t {
-  bool square;
-  bool cross;
-  bool circle;
-  bool triangle;
-  bool l1;
-  bool r1;
-  bool options;
-  bool share;
-} button;
-
 uint8_t myBoardId = 2;
 
 // CANモーターコントローラー
-CanMotorController motorController(2, motors, 4); // Board ID=2, 4モーター
+CanMotorController motorController(2, 4); // Board ID=2, 4モーター
 
 // オドメトリエンコーダー変数
 volatile int32_t encoderX_count = 0;
@@ -56,20 +38,6 @@ const float WHEEL_DIAMETER = 0.038f;       // ホイール直径 [m] (38mm)
 const float WHEEL_CIRCUMFERENCE = PI * WHEEL_DIAMETER;  // 円周 [m]
 const uint32_t SPEED_UPDATE_INTERVAL = 10; // 速度更新間隔 [ms]
 
-
-// フレーム1: state + mode + スティック（6バイト）
-struct ControllerFrame1 {
-  uint8_t state;           // 1バイト
-  uint8_t mode;            // 1バイト
-  int8_t lx, ly;          // 2バイト
-  int8_t rx, ry;          // 2バイト
-} __attribute__((packed));
-
-// フレーム2: ボタン + トリガー（4バイト）
-struct ControllerFrame2 {
-  uint16_t buttons;        // 2バイト
-  uint8_t l2, r2;         // 2バイト（フル精度）
-} __attribute__((packed));
 
 // オドメトリ速度送信フレーム（ID: 0x200）
 struct OdometrySpeedFrame {
@@ -103,9 +71,9 @@ void encoderX_ISR() {
     
     // A相の変化でカウント、B相の状態で方向判定
     if (stateA == stateB) {
-        encoderX_count--;
-    } else {
         encoderX_count++;
+    } else {
+        encoderX_count--;
     }
 }
 
@@ -197,10 +165,8 @@ IntervalTimer motorControlTimer;
 
 // モーター制御ISR - ライブラリで処理
 void motorControlISR() {
-    motorController.executeCommands();
+    motors.flush();
 }
-
-
 
 
 uint8_t readBoardId() {
@@ -240,12 +206,9 @@ void setup() {
   can1.enableFIFO();
   can1.enableFIFOInterrupt();
   can1.onReceive(handleMotorCommand);
-  
-  // モーターコントローラー初期化
-  motorController.setDebugOutput(false);
-  
+    
   // ホイール制御コールバック設定
-  motorController.setControlCallback([](uint8_t idx, const MotorCommand &cmd, DjiMotorCan<CAN2> &motors) {
+  motorController.setControlCallback([](uint8_t idx, const MotorCommand &cmd) {
       float value = CanMotorController::convertToFloat(cmd.value);
       
       switch (cmd.mode) {
@@ -285,5 +248,5 @@ void loop() {
   Serial.println(" m/s");
   // teensy2はCANコマンドのみに応答
   // タイマー割り込みで制御実行
-  delay(10);
+  delay(50);
 }

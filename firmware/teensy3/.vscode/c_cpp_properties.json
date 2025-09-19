@@ -10,6 +10,7 @@
             "includePath": [
                 "C:/Users/sd23097/Desktop/GenericControlBoad/firmware/teensy3/include",
                 "C:/Users/sd23097/Desktop/GenericControlBoad/firmware/teensy3/src",
+                "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/Servo",
                 "C:/Users/sd23097/Desktop/GenericControlBoad/firmware/teensy3/.pio/libdeps/teensy40/FlexCAN_T4",
                 "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/cores/teensy4",
                 "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/ADC",
@@ -83,7 +84,6 @@
                 "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/ST7735_t3/src",
                 "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/SdFat/src",
                 "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/SerialFlash",
-                "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/Servo",
                 "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/ShiftPWM",
                 "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/Snooze/src",
                 "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/SoftPWM",
@@ -118,6 +118,7 @@
                 "path": [
                     "C:/Users/sd23097/Desktop/GenericControlBoad/firmware/teensy3/include",
                     "C:/Users/sd23097/Desktop/GenericControlBoad/firmware/teensy3/src",
+                    "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/Servo",
                     "C:/Users/sd23097/Desktop/GenericControlBoad/firmware/teensy3/.pio/libdeps/teensy40/FlexCAN_T4",
                     "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/cores/teensy4",
                     "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/ADC",
@@ -191,7 +192,6 @@
                     "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/ST7735_t3/src",
                     "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/SdFat/src",
                     "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/SerialFlash",
-                    "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/Servo",
                     "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/ShiftPWM",
                     "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/Snooze/src",
                     "C:/Users/sd23097/.platformio/packages/framework-arduinoteensy/libraries/SoftPWM",

@@ -37,26 +37,27 @@ struct DjiFeedback {
     uint16_t lastAngleRaw;   // 前回エンコーダ値 (内部用)
     bool     isTimeout;      // タイムアウト状態
     float    gearRatio_;     // 親クラスのギア比参照用
+    float    cnt2rad_;       // カウント→ラジアン変換係数
+    float    cnt2deg_;       // カウント→度変換係数
     
     DjiFeedback() : angleRaw(0), speedRaw(0), current(0), positionCnt(0), 
-                    lastUpdateTime(0), lastAngleRaw(0), isTimeout(true), gearRatio_(36.0f) {}
+                    lastUpdateTime(0), lastAngleRaw(0), isTimeout(true), gearRatio_(36.0f),
+                    cnt2rad_(DjiConstants::PI_2 / (DjiConstants::ENCODER_CPR * 36.0f)),
+                    cnt2deg_(360.0f / (DjiConstants::ENCODER_CPR * 36.0f)) {}
     
     // 実際の回転角度[deg]を直接取得
     DJI_FORCE_INLINE float getAngleDegrees() const {
-        const float conversion = 360.0f / (DjiConstants::ENCODER_CPR * gearRatio_);
-        return positionCnt * conversion;
+        return positionCnt * cnt2deg_;
     }
     
     // 実際の回転角度[rad]を直接取得 (多回転対応)
     DJI_FORCE_INLINE float getAngleRadians() const {
-        const float conversion = DjiConstants::PI_2 / (DjiConstants::ENCODER_CPR * gearRatio_);
-        return positionCnt * conversion;
+        return positionCnt * cnt2rad_;
     }
     
     // -π~π正規化角度[rad]
     DJI_FORCE_INLINE float getAngleRadiansWrapped() const {
-        const float conversion = DjiConstants::PI_2 / (DjiConstants::ENCODER_CPR * gearRatio_);
-        float angle = positionCnt * conversion;
+        float angle = positionCnt * cnt2rad_;
         // -π ~ π に正規化
         while (angle > 3.141592653589793f) angle -= DjiConstants::PI_2;
         while (angle < -3.141592653589793f) angle += DjiConstants::PI_2;
@@ -74,7 +75,11 @@ struct DjiFeedback {
     }
     
     // 内部用: ギア比更新
-    void updateGearRatio(float gearRatio) { gearRatio_ = gearRatio; }
+    void updateGearRatio(float gearRatio) { 
+        gearRatio_ = gearRatio; 
+        cnt2rad_ = DjiConstants::PI_2 / (DjiConstants::ENCODER_CPR * gearRatio);
+        cnt2deg_ = 360.0f / (DjiConstants::ENCODER_CPR * gearRatio);
+    }
 };
 
 /**
@@ -136,7 +141,7 @@ public:
         bus_.enableFIFO();
         bus_.enableFIFOInterrupt();
         bus_.onReceive(isr);              // 受信割り込み時にisr関数を呼ぶ
-        // 全フィードバック構造体にデフォルトギア比を設定
+        // 全フィードバック構造体にデフォルトギア比と変換係数を設定
         for (int i = 0; i < 8; i++) {
             fb_[i].updateGearRatio(gearRatios_[i]);
         }
@@ -151,10 +156,13 @@ public:
         // タイムアウトチェック
         updateTimeoutStatus();
         const uint8_t idx = motorId - 1;
-        if (fb_[idx].isTimeout) {
-            currentCmd = 0;  // タイムアウト時は電流0で安全停止
-        }
-        
+        // if (fb_[idx].isTimeout) {
+        //     currentCmd = 0;  // タイムアウト時は電流0で安全停止
+        // }
+
+        if(fb_[idx].current > 3000 && currentCmd > 3000) currentCmd = 3200;
+        else if(fb_[idx].current < -3000 && currentCmd < -3000) currentCmd = -3200;
+
         const uint8_t group = (motorId - 1) / 4;  // グループ（0: ID1-4→0x200, 1: ID5-8→0x1FF）
         const uint8_t slot  = (motorId - 1) % 4;  // グループ内のスロット(0～3番目)
         CAN_message_t &frm = txFrame_[group];
@@ -187,6 +195,24 @@ public:
     const DjiFeedback& feedback(uint8_t motorId) const {
         return fb_[motorId - 1];
     }
+    
+    // モーターの角度[rad]取得 (多回転対応、最適化済み)
+    DJI_FORCE_INLINE float getAngleRadians(uint8_t motorId) const {
+        if (motorId < 1 || motorId > 8) return 0.0f;
+        const uint8_t idx = motorId - 1;
+        return fb_[idx].positionCnt * cnt2rad_[idx];
+    }
+    
+    // モーターの-π~π正規化角度[rad]取得 (最適化済み)
+    DJI_FORCE_INLINE float getAngleRadiansWrapped(uint8_t motorId) const {
+        if (motorId < 1 || motorId > 8) return 0.0f;
+        const uint8_t idx = motorId - 1;
+        float angle = fb_[idx].positionCnt * cnt2rad_[idx];
+        // -π ~ π に正規化
+        while (angle > 3.141592653589793f) angle -= DjiConstants::PI_2;
+        while (angle < -3.141592653589793f) angle += DjiConstants::PI_2;
+        return angle;
+    }
 
     // タイムアウト状態更新 (内部用)
     void updateTimeoutStatus(uint32_t timeoutMs = 100) {
@@ -215,9 +241,8 @@ public:
     void resetAngle(uint8_t motorId, float resetAngleRad) {
         if (motorId < 1 || motorId > 8) return;
         const uint8_t idx = motorId - 1;
-        // 角度[rad]をエンコーダのカウント値に換算 (1回転=8192カウント, 各モーターのギア比使用)
-        const float cnt2rad = DjiConstants::PI_2 / (8192.0f * gearRatios_[idx]);
-        const int32_t resetCnt = static_cast<int32_t>(resetAngleRad / cnt2rad);
+        // 角度[rad]をエンコーダのカウント値に換算 (フィードバック構造体の変換係数を使用)
+        const int32_t resetCnt = static_cast<int32_t>(resetAngleRad / fb_[idx].cnt2rad_);
         // 現在のエンコーダ生値を基準に積算位置カウントを調整
         fb_[idx].positionCnt = resetCnt;
         fb_[idx].lastAngleRaw = fb_[idx].angleRaw;
@@ -241,6 +266,7 @@ private:
     // フィードバック処理 (割り込み内で自動実行)
     void processMessage(const CAN_message_t &msg) {
         if (DJI_UNLIKELY(msg.id < 0x201 || msg.id > 0x208)) return;
+        updateTimeoutStatus();
         
         const uint8_t idx = msg.id - 0x201;
         DjiFeedback &fb_ref = fb_[idx];
@@ -249,11 +275,11 @@ private:
         const uint16_t ang  = (static_cast<uint16_t>(msg.buf[0]) << 8) | msg.buf[1];
         const int16_t  rpm  = (static_cast<int16_t>(msg.buf[2]) << 8) | msg.buf[3];
         const int16_t  curr = (static_cast<int16_t>(msg.buf[4]) << 8) | msg.buf[5];
-        
+
         // 多回転処理
         const int16_t delta_raw = ang - fb_ref.lastAngleRaw;
         int16_t delta;
-        
+
         if (DJI_LIKELY(delta_raw >= -DjiConstants::HALF_ENCODER_CPR && delta_raw <= DjiConstants::HALF_ENCODER_CPR)) {
             delta = delta_raw;
         } else {
@@ -276,6 +302,7 @@ private:
     CAN_message_t txFrame_[2];     // 送信バッファ [0x200, 0x1FF]
     DjiFeedback   fb_[8];          // モーター1-8のフィードバック
     float         gearRatios_[8];  // 各モーターのギア比
+    float         cnt2rad_[8];     // 各モーターのカウント→ラジアン変換係数
     static DjiMotorCan<CAN_BUS>* _self;  // 割り込み用インスタンス
 };
 
